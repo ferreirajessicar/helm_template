@@ -1,0 +1,128 @@
+name: Helm Values Template Preview
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  helm-template-values:
+    name: Render Helm templates for changed values
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Detect changes and run Helm template
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "GitHub event: $GITHUB_EVENT_NAME"
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            BASE_REF="${GITHUB_BASE_REF}"
+            echo "Pull request detected. Base ref: $BASE_REF"
+
+            git fetch origin "$BASE_REF" --depth=1
+            BASE_SHA=$(git merge-base HEAD "origin/$BASE_REF")
+            changed_files=$(git diff --name-only "$BASE_SHA"...HEAD || true)
+          else
+            echo "Push detected. Using previous commit as base."
+            if git rev-parse HEAD^ >/dev/null 2>&1; then
+              changed_files=$(git diff --name-only HEAD^ HEAD || true)
+            else
+              echo "No previous commit found (initial commit)."
+              changed_files=""
+            fi
+          fi
+
+          echo "Changed files:"
+          echo "${changed_files:-<none>}"
+
+          echo "$changed_files" | grep '^helm/values/' > changed_values.txt || true
+
+          if [ ! -s changed_values.txt ]; then
+            echo "No helm/values/ changes detected. Skipping Helm template rendering."
+            exit 0
+          fi
+
+          echo "Changed values files:"
+          cat changed_values.txt
+
+          jobs_file=".helm_jobs.txt"
+          > "$jobs_file"
+
+          while read -r file; do
+            [ -z "${file:-}" ] && continue
+
+            # helm/values/<type>/<service>/<env>.yaml
+            type=$(echo "$file" | cut -d'/' -f3)
+            service=$(echo "$file" | cut -d'/' -f4)
+            env_file=$(basename "$file")
+            env="${env_file%.yaml}"
+
+            if [ "$env" = "common" ]; then
+              for candidate in dev qa; do
+                if [ -f "helm/values/$type/$service/$candidate.yaml" ]; then
+                  echo "$type;$service;$candidate" >> "$jobs_file"
+                fi
+              done
+            else
+              echo "$type;$service;$env" >> "$jobs_file"
+            fi
+          done < changed_values.txt
+
+          if [ ! -s "$jobs_file" ]; then
+            echo "No Helm jobs generated from helm/values changes. Nothing to render."
+            exit 0
+          fi
+
+          sort -u "$jobs_file" -o "$jobs_file"
+
+          echo "Planned Helm render jobs (type;service;env):"
+          cat "$jobs_file"
+
+          while IFS=';' read -r type service env; do
+            [ -z "${type:-}" ] && continue
+
+            case "$type" in
+              bartender) chart="helm/charts/bartender" ;;
+              nginx)     chart="helm/charts/nginx" ;;
+              cronjob)   chart="helm/charts/cronjob" ;;
+              *)
+                echo "Unknown type '$type' for service '$service'. Skipping."
+                continue
+                ;;
+            esac
+
+            common_file="helm/values/$type/$service/common.yaml"
+            env_file="helm/values/$type/$service/$env.yaml"
+
+            if [ ! -f "$common_file" ]; then
+              echo "Common values '$common_file' not found. Skipping $type/$service/$env."
+              continue
+            fi
+
+            if [ ! -f "$env_file" ]; then
+              echo "Environment values '$env_file' not found. Skipping $type/$service/$env."
+              continue
+            fi
+
+            echo "=============================================="
+            echo " Rendering: type=$type service=$service env=$env"
+            echo " Chart:     $chart"
+            echo " Values:    $common_file + $env_file"
+            echo "=============================================="
+
+            helm template "$service-$env" "$chart" \
+              -f "$common_file" \
+              -f "$env_file"
+          done < "$jobs_file"
