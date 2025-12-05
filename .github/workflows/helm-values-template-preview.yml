@@ -137,16 +137,34 @@ jobs:
             echo "=============================================="
 
             output_file="$output_dir/${type}-${service}-${env}.yaml"
+            error_file="$output_dir/${type}-${service}-${env}-error.log"
 
-            # Captura stdout + stderr no arquivo
+            # tenta renderizar, separando stdout (YAML) e stderr (erros)
             if helm template "$service-$env" "$chart" \
               -f "$common_file" \
-              -f "$env_file" > "$output_file" 2>&1; then
+              -f "$env_file" > "$output_file" 2> "$error_file"; then
+
+              # sucesso: apaga log de erro vazio e registra no resumo
+              if [ ! -s "$error_file" ]; then
+                rm -f "$error_file"
+              fi
+
               echo "- ✅ $type / $service ($env) — rendered to \`$output_file\`" >> "$summary_file"
             else
-              echo "::error::Helm template failed for $type/$service/$env. See $output_file in artifact 'helm-templates'."
-              echo "- ❌ $type / $service ($env) — template failed, see \`$output_file\` in artifact 'helm-templates'." >> "$summary_file"
               had_error=1
+              echo "::error::Helm template failed for $type/$service/$env. See $error_file in artifact 'helm-templates'."
+
+              err_snippet=$(head -n 15 "$error_file" || echo "no error output")
+
+              {
+                echo "- ❌ $type / $service ($env) — template failed."
+                echo ""
+                echo "  Error (first lines):"
+                echo ""
+                echo '  ```'
+                echo "$err_snippet" | sed 's/^/  /'
+                echo '  ```'
+              } >> "$summary_file"
             fi
           done < "$jobs_file"
 
@@ -170,6 +188,7 @@ jobs:
           name: helm-templates
           path: helm-template-output
           if-no-files-found: ignore
+          retention-days: 7
 
       - name: Comment summary on pull request
         if: ${{ always() && github.event_name == 'pull_request' }}
