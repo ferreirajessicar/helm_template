@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bartender.fullname" . }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "bartender.fullname" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "bartender.fullname" . }}
+    spec:
+      containers:
+        - name: {{ include "bartender.fullname" . }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: 80
