@@ -313,6 +313,85 @@ jobs:
           output_dir="helm-template-output"
           summary_file="$output_dir/summary.md"
 
-          if [ !
+          if [ ! -d "$output_dir" ]; then
+            echo "No helm-template-output directory found. Skipping kubectl validation."
+            exit 0
+          fi
 
-::contentReference[oaicite:0]{index=0}
+          yaml_files=$(find "$output_dir" -maxdepth 1 -type f -name '*-after.yaml' || true)
+
+          if [ -z "$yaml_files" ]; then
+            echo "No rendered AFTER YAML files found to validate with kubectl."
+            exit 0
+          fi
+
+          echo "kubectl client version:"
+          kubectl version --client
+
+          had_error_kubectl=0
+
+          {
+            echo ""
+            echo "## kubectl validation (dry-run=client)"
+            echo ""
+          } >> "$summary_file"
+
+          for f in $yaml_files; do
+            name=$(basename "$f")
+            echo "Validating with kubectl: $f"
+
+            if out=$(kubectl apply --dry-run=client -f "$f" 2>&1 >/dev/null); then
+              echo "kubectl validation OK for $f"
+              echo "- ✅ kubectl validation passed for \`$name\`" >> "$summary_file"
+            else
+              echo "::error::kubectl validation failed for $f"
+              had_error_kubectl=1
+              snippet=$(echo "$out" | head -n 15)
+
+              {
+                echo "- ❌ kubectl validation failed for \`$name\`"
+                echo ""
+                echo "  Error (first lines):"
+                echo ""
+                echo '  ```'
+                echo "$snippet" | sed 's/^/  /'
+                echo '  ```'
+                echo ""
+              } >> "$summary_file"
+            fi
+          done
+
+          if [ "$had_error_kubectl" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Comment summary on pull request
+        if: ${{ always() && github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = 'helm-template-output/summary.md';
+
+            let summary = '';
+            try {
+              summary = fs.readFileSync(path, 'utf8');
+            } catch (err) {
+              summary = '_No Helm summary file found._';
+            }
+
+            const prNumber = context.payload.pull_request.number;
+
+            const body = [
+              '## Helm values validation (before / after / diff + kubectl)',
+              '',
+              summary
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });
