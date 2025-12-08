@@ -1,5 +1,10 @@
 name: Helm Values Template Preview
 
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 on:
   push:
     branches:
@@ -8,6 +13,8 @@ on:
 
 jobs:
   helm-template-values:
+    # não roda em pushes feitos pelo Argo Image Updater
+    if: ${{ !(github.event_name == 'push' && github.actor == 'argocd-image-updater') }}
     name: Render Helm templates for changed values
     runs-on: ubuntu-latest
 
@@ -19,6 +26,11 @@ jobs:
 
       - name: Install Helm
         uses: azure/setup-helm@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
 
       - name: Detect changes and render Helm templates with diff
         shell: bash
@@ -292,33 +304,15 @@ jobs:
             exit 1
           fi
 
-      - name: Comment summary on pull request
-        if: ${{ always() && github.event_name == 'pull_request' }}
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const path = 'helm-template-output/summary.md';
+      - name: Validate rendered manifests with kubectl (dry-run=client)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            let summary = '';
-            try {
-              summary = fs.readFileSync(path, 'utf8');
-            } catch (err) {
-              summary = '_No Helm summary file found._';
-            }
+          output_dir="helm-template-output"
+          summary_file="$output_dir/summary.md"
 
-            const prNumber = context.payload.pull_request.number;
+          if [ !
 
-            const body = [
-              '## Helm values validation (before / after / diff)',
-              '',
-              summary
-            ].join('\n');
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-              body
-            });
+::contentReference[oaicite:0]{index=0}
