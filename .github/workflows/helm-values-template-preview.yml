@@ -20,12 +20,14 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
-      - name: Detect changes and render Helm templates
+      - name: Detect changes and render Helm templates with diff
         shell: bash
         run: |
           set -euo pipefail
 
           echo "GitHub event: $GITHUB_EVENT_NAME"
+
+          BASE_SHA=""
 
           # Descobre o diff base
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
@@ -34,14 +36,29 @@ jobs:
 
             git fetch origin "$BASE_REF" --depth=1
             BASE_SHA=$(git merge-base HEAD "origin/$BASE_REF")
-            changed_files=$(git diff --name-only "$BASE_SHA"...HEAD || true)
           else
             echo "Push detected. Using previous commit as base."
             if git rev-parse HEAD^ >/dev/null 2>&1; then
-              changed_files=$(git diff --name-only HEAD^ HEAD || true)
+              BASE_SHA=$(git rev-parse HEAD^)
             else
               echo "No previous commit found (initial commit)."
-              changed_files=""
+              BASE_SHA=""
+            fi
+          fi
+
+          if [ -n "${BASE_SHA:-}" ]; then
+            echo "Base SHA for 'before' rendering: $BASE_SHA"
+          else
+            echo "No BASE_SHA available. 'Before' render may be skipped."
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            changed_files=$(git diff --name-only "$BASE_SHA"...HEAD || true)
+          else
+            if [ -n "${BASE_SHA:-}" ]; then
+              changed_files=$(git diff --name-only "$BASE_SHA" HEAD || true)
+            else
+              changed_files=$(git diff --name-only HEAD || true)
             fi
           fi
 
@@ -94,7 +111,6 @@ jobs:
           echo "Planned Helm render jobs (type;service;env):"
           cat "$jobs_file"
 
-          # Diretório e resumo dos templates renderizados
           output_dir="helm-template-output"
           mkdir -p "$output_dir"
 
@@ -103,7 +119,7 @@ jobs:
 
           had_error=0
 
-          # Renderiza cada combinação e grava em arquivo
+          # Renderiza cada combinação (antes/depois) e gera diff
           while IFS=';' read -r type service env; do
             [ -z "${type:-}" ] && continue
 
@@ -117,8 +133,11 @@ jobs:
                 ;;
             esac
 
-            common_file="helm/values/$type/$service/common.yaml"
-            env_file="helm/values/$type/$service/$env.yaml"
+            path_common="helm/values/$type/$service/common.yaml"
+            path_env="helm/values/$type/$service/$env.yaml"
+
+            common_file="$path_common"
+            env_file="$path_env"
 
             if [ ! -f "$common_file" ]; then
               echo "Common values '$common_file' not found. Skipping $type/$service/$env."
@@ -131,64 +150,147 @@ jobs:
             fi
 
             echo "=============================================="
-            echo " Rendering: type=$type service=$service env=$env"
-            echo " Chart:     $chart"
-            echo " Values:    $common_file + $env_file"
+            echo " Rendering AFTER: type=$type service=$service env=$env"
+            echo " Chart:          $chart"
+            echo " Values (after): $common_file + $env_file"
             echo "=============================================="
 
-            output_file="$output_dir/${type}-${service}-${env}.yaml"
-            error_file="$output_dir/${type}-${service}-${env}-error.log"
+            after_file="$output_dir/${type}-${service}-${env}-after.yaml"
+            after_error_file="$output_dir/${type}-${service}-${env}-after-error.log"
 
-            # tenta renderizar, separando stdout (YAML) e stderr (erros)
-            if helm template "$service-$env" "$chart" \
+            # Renderiza o DEPOIS (estado atual)
+            if ! helm template "$service-$env" "$chart" \
               -f "$common_file" \
-              -f "$env_file" > "$output_file" 2> "$error_file"; then
+              -f "$env_file" > "$after_file" 2> "$after_error_file"; then
 
-              # sucesso: apaga log de erro vazio e registra no resumo
-              if [ ! -s "$error_file" ]; then
-                rm -f "$error_file"
-              fi
-
-              echo "- ✅ $type / $service ($env) — rendered to \`$output_file\`" >> "$summary_file"
-            else
               had_error=1
-              echo "::error::Helm template failed for $type/$service/$env. See $error_file in artifact 'helm-templates'."
-
-              err_snippet=$(head -n 15 "$error_file" || echo "no error output")
+              err_snippet=$(head -n 20 "$after_error_file" || echo "no error output")
 
               {
-                echo "- ❌ $type / $service ($env) — template failed."
+                echo "### $type / $service ($env)"
+                echo ""
+                echo "- ❌ Helm template FAILED for current values."
                 echo ""
                 echo "  Error (first lines):"
                 echo ""
                 echo '  ```'
                 echo "$err_snippet" | sed 's/^/  /'
                 echo '  ```'
+                echo ""
+              } >> "$summary_file"
+
+              continue
+            fi
+
+            if [ ! -s "$after_error_file" ]; then
+              rm -f "$after_error_file"
+            fi
+
+            before_file=""
+            before_ok=0
+
+            # Tenta renderizar o ANTES a partir do BASE_SHA
+            if [ -n "${BASE_SHA:-}" ]; then
+              if git cat-file -e "$BASE_SHA:$path_common" 2>/dev/null && git cat-file -e "$BASE_SHA:$path_env" 2>/dev/null; then
+                echo "Rendering BEFORE for $type/$service/$env from $BASE_SHA"
+
+                tmp_common_before=$(mktemp)
+                tmp_env_before=$(mktemp)
+
+                git show "$BASE_SHA:$path_common" > "$tmp_common_before"
+                git show "$BASE_SHA:$path_env" > "$tmp_env_before"
+
+                before_file="$output_dir/${type}-${service}-${env}-before.yaml"
+                before_error_file="$output_dir/${type}-${service}-${env}-before-error.log"
+
+                if helm template "$service-$env-before" "$chart" \
+                  -f "$tmp_common_before" \
+                  -f "$tmp_env_before" > "$before_file" 2> "$before_error_file"; then
+                  before_ok=1
+                  if [ ! -s "$before_error_file" ]; then
+                    rm -f "$before_error_file"
+                  fi
+                else
+                  echo "Failed to render BEFORE for $type/$service/$env (base $BASE_SHA)"
+                  err_snippet_before=$(head -n 10 "$before_error_file" || echo "no error output")
+
+                  {
+                    echo "### $type / $service ($env)"
+                    echo ""
+                    echo "- ✅ Helm template rendered for current values."
+                    echo "- ⚠️ Could not render previous version from base commit ($BASE_SHA)."
+                    echo ""
+                    echo "  Error rendering BEFORE (first lines):"
+                    echo ""
+                    echo '  ```'
+                    echo "$err_snippet_before" | sed 's/^/  /'
+                    echo '  ```'
+                    echo ""
+                  } >> "$summary_file"
+                fi
+
+                rm -f "$tmp_common_before" "$tmp_env_before"
+              else
+                echo "No previous values found at BASE_SHA for $type/$service/$env. Only AFTER will be shown."
+
+                {
+                  echo "### $type / $service ($env)"
+                  echo ""
+                  echo "- ✅ Helm template rendered for current values."
+                  echo "- ℹ️ No previous values found at base commit ($BASE_SHA)."
+                  echo ""
+                } >> "$summary_file"
+              fi
+            else
+              echo "No BASE_SHA set. Only AFTER will be shown for $type/$service/$env."
+
+              {
+                echo "### $type / $service ($env)"
+                echo ""
+                echo "- ✅ Helm template rendered for current values."
+                echo "- ℹ️ No base commit available to compute BEFORE."
+                echo ""
               } >> "$summary_file"
             fi
+
+            # Se conseguimos renderizar ANTES e DEPOIS, gera diff
+            if [ "$before_ok" -eq 1 ]; then
+              diff_snippet=$(diff -u "$before_file" "$after_file" || true)
+
+              # Se o diff for vazio, deixa claro também
+              if [ -z "$diff_snippet" ]; then
+                diff_snippet="(no differences between BEFORE and AFTER)"
+              fi
+
+              {
+                echo "### $type / $service ($env)"
+                echo ""
+                echo "- ✅ Helm template rendered for previous and current values."
+                echo ""
+                echo "Diff (BEFORE → AFTER):"
+                echo ""
+                echo '```diff'
+                echo "$diff_snippet"
+                echo '```'
+                echo ""
+              } >> "$summary_file"
+            fi
+
           done < "$jobs_file"
 
           # Joga o resumo também no Job Summary do GitHub
           if [ -s "$summary_file" ]; then
             {
-              echo "## Helm values validation"
+              echo "## Helm values validation (before/after/diff)"
+              echo ""
               cat "$summary_file"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # Se algum job quebrou, falha o workflow
+          # Se algum AFTER quebrou, falha o workflow
           if [ "$had_error" -ne 0 ]; then
             exit 1
           fi
-
-      - name: Upload rendered Helm templates
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: helm-templates
-          path: helm-template-output
-          if-no-files-found: ignore
-          retention-days: 7
 
       - name: Comment summary on pull request
         if: ${{ always() && github.event_name == 'pull_request' }}
@@ -209,11 +311,9 @@ jobs:
             const prNumber = context.payload.pull_request.number;
 
             const body = [
-              '## Helm values validation',
+              '## Helm values validation (before / after / diff)',
               '',
-              summary,
-              '',
-              'Artifacts: check the **helm-templates** artifact in this workflow run.'
+              summary
             ].join('\n');
 
             await github.rest.issues.createComment({
