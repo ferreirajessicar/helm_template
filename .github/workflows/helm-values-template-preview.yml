@@ -325,6 +325,15 @@ jobs:
             exit 0
           fi
 
+          # kubeconfig FAKE só para validação client-side
+          export KUBECONFIG="$(mktemp)"
+          kubectl config set-cluster dummy \
+            --server=https://example.invalid \
+            --insecure-skip-tls-verify=true >/dev/null 2>&1
+          kubectl config set-credentials dummy >/dev/null 2>&1
+          kubectl config set-context dummy --cluster=dummy --user=dummy >/dev/null 2>&1
+          kubectl config use-context dummy >/dev/null 2>&1
+
           echo "kubectl client version:"
           kubectl version --client
 
@@ -340,13 +349,17 @@ jobs:
             name=$(basename "$f")
             echo "Validating with kubectl: $f"
 
-            if out=$(kubectl apply --dry-run=client -f "$f" 2>&1 >/dev/null); then
+            if out=$(kubectl apply --dry-run=client -f "$f" 2>&1); then
               echo "kubectl validation OK for $f"
               echo "- ✅ kubectl validation passed for \`$name\`" >> "$summary_file"
             else
               echo "::error::kubectl validation failed for $f"
               had_error_kubectl=1
               snippet=$(echo "$out" | head -n 15)
+
+              echo "----- kubectl error for $f -----"
+              echo "$snippet"
+              echo "--------------------------------"
 
               {
                 echo "- ❌ kubectl validation failed for \`$name\`"
